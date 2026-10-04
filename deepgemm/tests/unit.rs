@@ -23,6 +23,7 @@ fn sm100_heuristics_normal_gemm() {
         with_accumulation: false,
         num_sms: 148,
         tc_util: 100,
+        k_grouped: false,
     };
     let cfg = best_config(&desc);
     assert_eq!(cfg.layout.block_k, 256, "MXF4 block K");
@@ -60,6 +61,7 @@ fn sm100_heuristics_grouped_swap_ab() {
         with_accumulation: false,
         num_sms: 148,
         tc_util: 100,
+        k_grouped: false,
     };
     let cfg = best_config(&desc);
     assert!(cfg.layout.swap_ab, "m-grouped must swap AB");
@@ -135,7 +137,7 @@ fn mxfp4_reference_gemm_matches_float() {
     let b_sf = pack_sf(&b_sfs, n);
     let got = mxfp4_gemm_reference(&a_pack, &a_sf, m, &b_pack, &b_sf, n, k);
     // compare against direct fp32 quantized math
-    let dequant = |row: &[f32], packed: &[u8], sfs: &[u8], r: usize| -> Vec<f32> {
+    let dequant = |_row: &[f32], packed: &[u8], sfs: &[u8], r: usize| -> Vec<f32> {
         (0..k)
             .map(|kk| {
                 let (lo, hi) = decode_e2m1_pair(packed[r * (k / 2) + kk / 2]);
@@ -153,4 +155,41 @@ fn mxfp4_reference_gemm_matches_float() {
             assert!(diff < 1e-3, "({i},{j}): {got:?} vs {want:?}");
         }
     }
+}
+
+#[test]
+fn sm100_mk_alignment_knob_selects_block_m() {
+    use deepgemm::heuristics_sm100::{best_config, Sm100Desc};
+    use deepgemm::types::{
+        get_mk_alignment_for_contiguous_layout, get_theoretical_mk_alignment_for_contiguous_layout,
+        set_mk_alignment_for_contiguous_layout, GemmType,
+    };
+    let desc = Sm100Desc {
+        gemm_type: GemmType::MGroupedContiguous,
+        use_psum_layout: true,
+        m: 8192,
+        n: 7168,
+        k: 7168,
+        num_groups: 256,
+        expected_m: 8192,
+        expected_num_groups: 1,
+        a_bits: 4,
+        b_bits: 4,
+        major_a_mn: false,
+        major_b_mn: false,
+        cd_dtype: 0,
+        with_accumulation: false,
+        num_sms: 148,
+        tc_util: 100,
+        k_grouped: false,
+    };
+    set_mk_alignment_for_contiguous_layout(128);
+    assert_eq!(best_config(&desc).layout.block_m, 128);
+    // SM100's theoretical alignment (UMMA_N=256): block M follows the knob
+    set_mk_alignment_for_contiguous_layout(get_theoretical_mk_alignment_for_contiguous_layout(10));
+    assert_eq!(get_mk_alignment_for_contiguous_layout(), 256);
+    let cfg = best_config(&desc);
+    assert_eq!(cfg.layout.block_m, 256);
+    assert!(cfg.smem_size <= deepgemm::heuristics_sm100::SM100_SMEM_CAPACITY);
+    set_mk_alignment_for_contiguous_layout(128);
 }

@@ -66,13 +66,17 @@ DG_INLINE float dg_sf_inv_f32(uint32_t sf_exp) {
 // 64 packed bytes, one SF word.
 //   src: (rows, ld) bf16, k-major
 //   dst: (rows, k/2) e2m1 pairs
-//   sf:  (ceil(k/128), sf_stride) u32 words, sf[col * sf_stride + row]
+//   sf:  grouped-packed UE8M0: with `num_groups` G, `rows = G * group_rows`,
+//        the SF of (group g, local row r, word col c) lives at
+//        `sf[(g * sf_cols + c) * sf_stride + r]` — i.e. the (tma-aligned
+//        group_rows, sf_cols * G) layout the SM100 SF TMA expects.
+//        G = 1 reduces to the flat (sf_cols, sf_stride) layout.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void deepgemm_cast_bf16_to_fp4_packed_sf(
         const uint16_t* __restrict__ src, uint32_t src_ld,
         uint8_t* __restrict__ dst, uint32_t dst_ld_bytes,
         uint32_t* __restrict__ sf, uint32_t sf_stride,
-        uint32_t rows, uint32_t k) {
+        uint32_t rows, uint32_t k, uint32_t num_groups) {
     const uint32_t col = blockIdx.x;             // 128-element slice index
     const uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
     if (row >= rows) return;
@@ -111,7 +115,11 @@ extern "C" __global__ void deepgemm_cast_bf16_to_fp4_packed_sf(
         for (uint32_t i = 0; i < 8; ++ i) v[i] = vals[w * 8 + i];
         dst_words[w] = dg_f32x8_to_e2m1x8(v);
     }
-    sf[static_cast<size_t>(col) * sf_stride + row] = sf_word;
+    const uint32_t group_rows = num_groups > 1 ? rows / num_groups : rows;
+    const uint32_t group = num_groups > 1 ? row / group_rows : 0;
+    const uint32_t local_row = row - group * group_rows;
+    const uint32_t sf_cols = (k + 127) / 128;
+    sf[(static_cast<size_t>(group) * sf_cols + col) * sf_stride + local_row] = sf_word;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +131,7 @@ template <uint32_t GRAN>
 DG_INLINE void cast_bf16_to_fp8_sf(const uint16_t* __restrict__ src, uint32_t src_ld,
                                    uint8_t* __restrict__ dst, uint32_t dst_ld,
                                    uint32_t* __restrict__ sf, uint32_t sf_stride,
-                                   uint32_t rows, uint32_t k,
+                                   uint32_t rows, uint32_t k, uint32_t num_groups,
                                    uint32_t row, uint32_t col) {
     constexpr uint32_t kNumElems = 4 * GRAN;
     const uint32_t k_base = col * kNumElems;
@@ -157,23 +165,27 @@ DG_INLINE void cast_bf16_to_fp8_sf(const uint16_t* __restrict__ src, uint32_t sr
     #pragma unroll
     for (uint32_t p = 0; p < kNumElems / 2; ++ p)
         dst_h[p] = static_cast<uint16_t>(dg_f32x2_to_e4m3x2(vals[p * 2], vals[p * 2 + 1]));
-    sf[static_cast<size_t>(col) * sf_stride + row] = sf_word;
+    const uint32_t group_rows = num_groups > 1 ? rows / num_groups : rows;
+    const uint32_t group = num_groups > 1 ? row / group_rows : 0;
+    const uint32_t local_row = row - group * group_rows;
+    const uint32_t sf_cols = (k + 4 * GRAN - 1) / (4 * GRAN);
+    sf[(static_cast<size_t>(group) * sf_cols + col) * sf_stride + local_row] = sf_word;
 }
 
 extern "C" __global__ void deepgemm_cast_bf16_to_fp8_sf_gran32(
         const uint16_t* __restrict__ src, uint32_t src_ld,
         uint8_t* __restrict__ dst, uint32_t dst_ld,
         uint32_t* __restrict__ sf, uint32_t sf_stride,
-        uint32_t rows, uint32_t k) {
-    cast_bf16_to_fp8_sf<32>(src, src_ld, dst, dst_ld, sf, sf_stride, rows, k,
+        uint32_t rows, uint32_t k, uint32_t num_groups) {
+    cast_bf16_to_fp8_sf<32>(src, src_ld, dst, dst_ld, sf, sf_stride, rows, k, num_groups,
                             blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x);
 }
 extern "C" __global__ void deepgemm_cast_bf16_to_fp8_sf_gran128(
         const uint16_t* __restrict__ src, uint32_t src_ld,
         uint8_t* __restrict__ dst, uint32_t dst_ld,
         uint32_t* __restrict__ sf, uint32_t sf_stride,
-        uint32_t rows, uint32_t k) {
-    cast_bf16_to_fp8_sf<128>(src, src_ld, dst, dst_ld, sf, sf_stride, rows, k,
+        uint32_t rows, uint32_t k, uint32_t num_groups) {
+    cast_bf16_to_fp8_sf<128>(src, src_ld, dst, dst_ld, sf, sf_stride, rows, k, num_groups,
                              blockIdx.y * blockDim.y + threadIdx.y, blockIdx.x);
 }
 
@@ -186,7 +198,7 @@ extern "C" __global__ void deepgemm_cast_bf16_to_fp8_sf_gran128(
 extern "C" __global__ void deepgemm_transform_sf1d_packed_ue8m0(
         const float* __restrict__ src, uint32_t src_ld,
         uint32_t* __restrict__ dst, uint32_t dst_stride,
-        uint32_t rows, uint32_t k, uint32_t gran) {
+        uint32_t rows, uint32_t k, uint32_t gran, uint32_t num_groups) {
     const uint32_t col = blockIdx.x;
     const uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
     if (row >= rows) return;
@@ -201,18 +213,24 @@ extern "C" __global__ void deepgemm_transform_sf1d_packed_ue8m0(
             ? __float_as_uint(src[static_cast<size_t>(row) * src_ld + kc]) : 0x3F800000u;
         word |= ((bits >> 23) & 0xFFu) << (j * 8);   // f32 exponent byte == UE8M0
     }
-    dst[static_cast<size_t>(col) * dst_stride + row] = word;
+    const uint32_t group_rows = num_groups > 1 ? rows / num_groups : rows;
+    const uint32_t group = num_groups > 1 ? row / group_rows : 0;
+    const uint32_t local_row = row - group * group_rows;
+    dst[(static_cast<size_t>(group) * ((k_cols + 3) / 4) + col) * dst_stride + local_row] = word;
 }
 
 // ---------------------------------------------------------------------------
 // FP32 (power-of-two) 2-D SF (128 x 128 tiles, the DeepSeek weight recipe)
 // -> packed UE8M0 1-D layout (gran 128): every row of a tile shares the SF.
 //   src: (ceil(rows/128), k/128) f32, k-major, stride src_ld
+//   dst: grouped-packed (see the fp4 cast kernel): with `num_groups` G,
+//        `rows = G * group_rows` and group g's rows are `[g*group_rows, ...)`;
+//        requires `group_rows % 128 == 0` so tiles never straddle groups.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void deepgemm_transform_sf2d_packed_ue8m0(
         const float* __restrict__ src, uint32_t src_ld,
         uint32_t* __restrict__ dst, uint32_t dst_stride,
-        uint32_t rows, uint32_t k) {
+        uint32_t rows, uint32_t k, uint32_t num_groups) {
     const uint32_t col = blockIdx.x;               // word index over K (512 elems)
     const uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
     if (row >= rows) return;
@@ -228,33 +246,44 @@ extern "C" __global__ void deepgemm_transform_sf2d_packed_ue8m0(
             ? __float_as_uint(src[static_cast<size_t>(tile_row) * src_ld + kc]) : 0x3F800000u;
         word |= ((bits >> 23) & 0xFFu) << (j * 8);
     }
-    dst[static_cast<size_t>(col) * dst_stride + row] = word;
+    const uint32_t group_rows = num_groups > 1 ? rows / num_groups : rows;
+    const uint32_t group = num_groups > 1 ? row / group_rows : 0;
+    const uint32_t local_row = row - group * group_rows;
+    dst[(static_cast<size_t>(group) * ((k_cols + 3) / 4) + col) * dst_stride + local_row] = word;
 }
 
 
 
 // ---------------------------------------------------------------------------
 // FP32 (power-of-two) SF, transposed TMA-aligned input -> packed UE8M0.
-//   src: (k / gran, tma_aligned(rows)) f32 (the SM90 `transform_sf` output)
+//   src: (k / gran, tma_aligned(rows)) f32 (the SM90 `transform_sf` output);
+//        with `num_groups` G the input carries G batches stacked along the
+//        leading dim: element (kc, g, r) at src[(g * k_cols + kc) * src_stride + r],
+//        i.e. the (G * k_cols, tma_aligned(rows)) layout of `transform_sf`.
+//   dst: grouped-packed: word (g, r, c) at dst[(g * cols + c) * dst_stride + r].
 // ---------------------------------------------------------------------------
 extern "C" __global__ void deepgemm_transform_sf_t_f32_to_packed_ue8m0(
         const float* __restrict__ src, uint32_t src_stride,
         uint32_t* __restrict__ dst, uint32_t dst_stride,
-        uint32_t rows, uint32_t k, uint32_t gran) {
+        uint32_t rows, uint32_t k, uint32_t gran, uint32_t num_groups) {
     const uint32_t col = blockIdx.x;
     const uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
     if (row >= rows) return;
     const uint32_t k_cols = (k + gran - 1) / gran;
     if (col * 4 >= k_cols) return;
+    const uint32_t group_rows = num_groups > 1 ? rows / num_groups : rows;
+    const uint32_t group = num_groups > 1 ? row / group_rows : 0;
+    const uint32_t local_row = row - group * group_rows;
     uint32_t word = 0;
     #pragma unroll
     for (uint32_t j = 0; j < 4; ++ j) {
         const uint32_t kc = col * 4 + j;
         const uint32_t bits = kc < k_cols
-            ? __float_as_uint(src[static_cast<size_t>(kc) * src_stride + row]) : 0x3F800000u;
+            ? __float_as_uint(src[(static_cast<size_t>(group) * k_cols + kc) * src_stride + local_row])
+            : 0x3F800000u;
         word |= ((bits >> 23) & 0xFFu) << (j * 8);
     }
-    dst[static_cast<size_t>(col) * dst_stride + row] = word;
+    dst[(static_cast<size_t>(group) * ((k_cols + 3) / 4) + col) * dst_stride + local_row] = word;
 }
 
 // ---------------------------------------------------------------------------

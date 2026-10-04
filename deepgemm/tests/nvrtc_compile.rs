@@ -101,6 +101,15 @@ fn layout_kernels_compile() {
 }
 
 #[test]
+fn sm100_cast_kernels_compile() {
+    expect_compile(
+        "sm100_cast",
+        &deepgemm::cuda::sm100_cast::build_sm100_cast_source(),
+        "sm_100a",
+    );
+}
+
+#[test]
 fn mqa_logits_compiles() {
     expect_compile(
         "mqa",
@@ -116,6 +125,7 @@ fn mqa_logits_compiles() {
 use deepgemm::cuda::bf16_gemm_sm100::{build_bf16_source, Bf16Config};
 use deepgemm::cuda::fp8_fp4_gemm_1d1d::{build_fp8_fp4_source, Fp8Fp4Config};
 
+#[allow(clippy::too_many_arguments)]
 fn fp8fp4_cfg(
     gt: u32,
     bm: u32,
@@ -148,10 +158,7 @@ fn fp8fp4_cfg(
         // K-major: swizzle must equal the storage bytes per K row
         swizzle_a: if is_mxf4 { 128 } else { block_k },
         swizzle_b: if is_mxf4 { 128 } else { block_k },
-        swizzle_cd: deepgemm::tma::get_swizzle_mode(
-            if swap_ab { bn } else { bn },
-            if cd == 1 { 4 } else { 2 },
-        ),
+        swizzle_cd: deepgemm::tma::get_swizzle_mode(bn, if cd == 1 { 4 } else { 2 }),
         num_stages: 4,
         num_tma_store_stages: 2,
         num_non_epilogue_threads: 128,

@@ -207,54 +207,6 @@ pub fn ref_m_grouped_fp8_gemm_nt_masked(
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn e4m3_roundtrip_known_values() {
-        assert_eq!(e4m3_to_f32(0x00), 0.0); // +-0
-        assert_eq!(e4m3_to_f32(0x40), 2.0); // e=8: 2^(8-7)
-        assert_eq!(e4m3_to_f32(0x38), 1.0); // e=7: 2^0
-        assert_eq!(e4m3_to_f32(0x30), 0.5); // e=6
-        assert_eq!(e4m3_to_f32(0x28), 0.25); // e=5
-        assert_eq!(e4m3_to_f32(0x01), 2f32.powi(-9)); // smallest subnormal
-        assert_eq!(e4m3_to_f32(0x7E), 448.0); // max finite
-        assert!(e4m3_to_f32(0x7F).is_nan());
-        assert_eq!(e4m3_to_f32(0xC0), -2.0);
-    }
-
-    #[test]
-    fn quantize_roundtrip() {
-        for x in [
-            0.0,
-            0.5,
-            1.0,
-            -1.0,
-            2.0,
-            0.25,
-            -0.125,
-            448.0,
-            -448.0,
-            2f32.powi(-9),
-        ] {
-            let q = f32_to_e4m3(x);
-            let d = e4m3_to_f32(q);
-            let scale = x.abs().max(1e-6);
-            assert!((d - x).abs() / scale < 0.2, "x={x} q={q:#x} d={d}");
-        }
-    }
-
-    #[test]
-    fn bf16_roundtrip() {
-        for x in [0.0, 1.0, -2.5, 0.25, 100.0] {
-            let b = f32_to_bf16(x);
-            let d = bf16_to_f32(b);
-            assert!((d - x).abs() / x.abs().max(1e-6) < 0.01, "x={x} d={d}");
-        }
-    }
-}
-
 // ===========================================================================
 // FP4 (e2m1) + UE8M0 reference codecs (CPU)
 // ===========================================================================
@@ -319,8 +271,8 @@ pub fn quantize_bf16_row_to_mxfp4(row: &[f32]) -> (Vec<u8>, Vec<u8>) {
         let amax = g.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
         // e2m1 finite max = 6
         let exp = ((amax.to_bits() + (1 << 23) - 1 - (0x40u32 << 16)) >> 23).max(1 + 127);
-        let exp = exp.min(255).max(1);
-        let sf = f32::from_bits((exp as u32) << 23);
+        let exp = exp.clamp(1, 255);
+        let sf = f32::from_bits((exp) << 23);
         let inv = 1.0 / sf;
         sfs.push(exp as u8);
         for pair in g.chunks(2) {
@@ -374,4 +326,52 @@ pub fn mxfp4_gemm_reference(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn e4m3_roundtrip_known_values() {
+        assert_eq!(e4m3_to_f32(0x00), 0.0); // +-0
+        assert_eq!(e4m3_to_f32(0x40), 2.0); // e=8: 2^(8-7)
+        assert_eq!(e4m3_to_f32(0x38), 1.0); // e=7: 2^0
+        assert_eq!(e4m3_to_f32(0x30), 0.5); // e=6
+        assert_eq!(e4m3_to_f32(0x28), 0.25); // e=5
+        assert_eq!(e4m3_to_f32(0x01), 2f32.powi(-9)); // smallest subnormal
+        assert_eq!(e4m3_to_f32(0x7E), 448.0); // max finite
+        assert!(e4m3_to_f32(0x7F).is_nan());
+        assert_eq!(e4m3_to_f32(0xC0), -2.0);
+    }
+
+    #[test]
+    fn quantize_roundtrip() {
+        for x in [
+            0.0,
+            0.5,
+            1.0,
+            -1.0,
+            2.0,
+            0.25,
+            -0.125,
+            448.0,
+            -448.0,
+            2f32.powi(-9),
+        ] {
+            let q = f32_to_e4m3(x);
+            let d = e4m3_to_f32(q);
+            let scale = x.abs().max(1e-6);
+            assert!((d - x).abs() / scale < 0.2, "x={x} q={q:#x} d={d}");
+        }
+    }
+
+    #[test]
+    fn bf16_roundtrip() {
+        for x in [0.0, 1.0, -2.5, 0.25, 100.0] {
+            let b = f32_to_bf16(x);
+            let d = bf16_to_f32(b);
+            assert!((d - x).abs() / x.abs().max(1e-6) < 0.01, "x={x} d={d}");
+        }
+    }
 }

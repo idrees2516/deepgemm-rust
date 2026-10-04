@@ -21,7 +21,12 @@ use cudarc::driver::safe::{CudaModule, CudaSlice};
 use crate::device::DgContext;
 use crate::launch::{ArgBuilder, DevPtr, LaunchGrid};
 use crate::ops::{dev_ptr, Fp8Tensor};
-use crate::types::{DgError, DgResult, MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT as ALIGN};
+use crate::types::{self, DgError, DgResult};
+
+/// The contiguous-layout alignment (runtime knob, upstream parity).
+fn align() -> u32 {
+    types::get_mk_alignment_for_contiguous_layout()
+}
 
 fn layout_module(ctx: &DgContext) -> DgResult<Arc<CudaModule>> {
     ctx.jit.module(
@@ -107,7 +112,8 @@ pub fn moe_fp8_layer(
     let sf_row_bytes = k_blocks * 4;
 
     // Worst-case padded rows (every group 128-aligned); never read on host.
-    let padded_m = num_tokens + num_experts * (ALIGN - 1);
+    let alignment = align();
+    let padded_m = num_tokens + num_experts * (alignment - 1);
     let lk = layout_module(ctx)?;
 
     // ---------------------------------------------------------- dispatch
@@ -147,7 +153,7 @@ pub fn moe_fp8_layer(
         a.push(&DevPtr(dev_ptr(ctx, &counts)));
         a.push(&DevPtr(dev_ptr(ctx, &offsets)));
         a.push(&num_experts);
-        a.push(&ALIGN);
+        a.push(&alignment);
         launch1(ctx, &lk, "deepgemm_permute_offsets", &mut a, 1, 32)?;
     }
     {

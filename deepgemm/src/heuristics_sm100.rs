@@ -9,8 +9,10 @@ use crate::types::GemmType;
 /// SM100a per-SM shared-memory capacity (227 KB, minus 1 KB reserved).
 pub const SM100_SMEM_CAPACITY: u32 = 232_448;
 
-/// Upstream `get_mk_alignment_for_contiguous_layout`.
-pub const MK_ALIGNMENT_FOR_CONTIGUOUS: u32 = 128;
+/// Upstream `get_mk_alignment_for_contiguous_layout` (runtime knob).
+pub fn mk_alignment_for_contiguous() -> u32 {
+    crate::types::get_mk_alignment_for_contiguous_layout()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sm100Layout {
@@ -78,6 +80,9 @@ pub struct Sm100Desc {
     pub num_sms: u32,
     /// Tensor-core utilization percentage (100 = off).
     pub tc_util: u32,
+    /// K-grouped contiguous layout (`GemmType::KGroupedContiguous[WithPsum]`,
+    /// kernel ids 3/6): enables the single-TMA-store-stage pacing heuristic.
+    pub k_grouped: bool,
 }
 
 fn is_m_grouped(t: GemmType) -> bool {
@@ -94,9 +99,13 @@ fn num_element_bits(a_bits: u32, b_bits: u32) -> u32 {
     }
 }
 
-fn smem_pack_factor(bits: u32) -> u32 {
-    // Packed FP4 stores two logical elements per byte (MXF4 path only).
-    if bits == 4 {
+/// Upstream `GemmDesc::get_smem_pack_factor`: FP4 is packed two-per-byte in
+/// SMEM **only** when *both* operands are FP4 (the dedicated MXF4 MMA).
+/// A mixed FP8 x FP4 pair runs on the MXF8F6F4 MMA, which consumes byte
+/// operands: the FP4 side is unpacked (one e2m1 code per byte) by the TMA
+/// (`16U4_ALIGN16B`), so its SMEM footprint is 1 byte per element.
+fn smem_pack_factor(a_bits: u32, b_bits: u32) -> u32 {
+    if a_bits == 4 && b_bits == 4 {
         2
     } else {
         1
@@ -144,16 +153,12 @@ fn get_storage_config(desc: &Sm100Desc, layout: &Sm100Layout) -> Sm100Storage {
     } else {
         (a_store_elem, b_store_elem)
     };
-    let pack_a = if is_bf16 {
+    let pack = if is_bf16 {
         1
     } else {
-        smem_pack_factor(desc.a_bits)
+        smem_pack_factor(desc.a_bits, desc.b_bits)
     };
-    let pack_b = if is_bf16 {
-        1
-    } else {
-        smem_pack_factor(desc.b_bits)
-    };
+    let (pack_a, pack_b) = (pack, pack);
 
     let inner_a = if desc.major_a_mn {
         load_block_m
@@ -181,11 +186,11 @@ fn get_storage_config(desc: &Sm100Desc, layout: &Sm100Layout) -> Sm100Storage {
 }
 
 fn get_num_tma_store_stages(desc: &Sm100Desc, layout: &Sm100Layout, bf16: bool) -> u32 {
-    if bf16 || layout.swap_ab || !matches!(desc.gemm_type, GemmType::MGroupedContiguous) {
+    // Upstream: single-stage TMA stores pace the store traffic (better DRAM
+    // throughput when C/D flushes dominate), but only for k-grouped GEMMs.
+    if bf16 || layout.swap_ab || !desc.k_grouped {
         return 2;
     }
-    // K-grouped GEMMs with many K blocks per group benefit from single-stage
-    // stores (pacing DRAM traffic); requires the k-grouped layout.
     let num_k_blocks_per_group = desc.k / desc.num_groups.max(1) / layout.block_k;
     let min_k_blocks = if desc.cd_dtype != 1 {
         16
@@ -228,16 +233,12 @@ fn get_pipeline_config(
 
     let is_bf16 = bf16;
     let (a_sz, b_sz) = if is_bf16 { (2, 2) } else { (1, 1) };
-    let pack_a = if is_bf16 {
+    let pack = if is_bf16 {
         1
     } else {
-        smem_pack_factor(desc.a_bits)
+        smem_pack_factor(desc.a_bits, desc.b_bits)
     };
-    let pack_b = if is_bf16 {
-        1
-    } else {
-        smem_pack_factor(desc.b_bits)
-    };
+    let (pack_a, pack_b) = (pack, pack);
     let smem_a_per_stage = storage.load_block_m * layout.block_k * a_sz / pack_a;
     let smem_b_per_stage = storage.load_block_n * layout.block_k * b_sz / pack_b;
 
@@ -253,11 +254,10 @@ fn get_pipeline_config(
     let smem_extra = smem_cd + smem_barriers + smem_tmem_ptr;
     let smem_per_stage =
         smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
-    let num_stages = if smem_per_stage == 0 {
-        MAX_STAGES
-    } else {
-        ((SM100_SMEM_CAPACITY - smem_extra) / smem_per_stage).min(MAX_STAGES)
-    };
+    let num_stages = (SM100_SMEM_CAPACITY - smem_extra)
+        .checked_div(smem_per_stage)
+        .unwrap_or(MAX_STAGES)
+        .min(MAX_STAGES);
     (
         smem_extra + num_stages * smem_per_stage,
         num_stages,
@@ -321,7 +321,7 @@ fn get_layout_candidates(desc: &Sm100Desc, bf16: bool) -> Vec<Sm100Layout> {
     if is_m_grouped(desc.gemm_type) {
         let swap_ab = true;
         let block_n = 128;
-        let block_m = MK_ALIGNMENT_FOR_CONTIGUOUS;
+        let block_m = mk_alignment_for_contiguous();
         let cluster_m = 1;
         let cluster_n = if desc.n.div_ceil(block_n) % 2 == 0 && desc.num_sms % 2 == 0 {
             2

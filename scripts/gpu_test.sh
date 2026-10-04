@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Full GPU test + verify run (needs a CUDA driver + Hopper GPU for FP8).
+# Full GPU test + verify run (Hopper or Blackwell; arch-mismatched tests skip).
+# FP8 kernels need Hopper (SM90a); FP4/MXFP8 kernels need Blackwell (SM100a).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo test --workspace

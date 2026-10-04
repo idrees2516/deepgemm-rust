@@ -1,15 +1,22 @@
 //! deepgemm-bench: correctness + benchmark CLI.
 //!
 //! ```sh
-//! # benchmark the DeepSeek-style FP8 GEMM shapes
-//! cargo run --release -p deepgemm-bench -- bench --op fp8_nt --m 4096 --n 7168 --k 7168
+//! # Blackwell-native MXFP4 GEMM: kernel-only TFLOPS + end-to-end row
+//! cargo run --release -p deepgemm-bench -- bench --op fp4_nt_native --m 8192 --n 8192 --k 7168
 //!
-//! # MoE grouped GEMM (contiguous), 256 experts
-//! cargo run --release -p deepgemm-bench -- bench --op grouped --groups 256 --n 7168 --k 7168
+//! # MoE grouped MXFP4 (contiguous / masked)
+//! cargo run --release -p deepgemm-bench -- bench --op fp4_grouped_contig --groups 256 --m 128
 //!
-//! # verify against the CPU reference
+//! # SM100 FP8 (DeepSeek gran-128 recipe and MXFP8 gran-32)
+//! cargo run --release -p deepgemm-bench -- bench --op fp8_nt_sm100 --m 4096 --n 7168 --k 7168
+//!
+//! # verify against the CPU reference (SM90 paths)
 //! cargo run --release -p deepgemm-bench -- verify --op fp8_nt --m 256 --n 512 --k 768
 //! ```
+//!
+//! `DG_PRINT_CONFIGS=1` (set by default for `bench`) prints every unique
+//! problem -> tile-config decision, so TFLOPS numbers can be correlated with
+//! the chosen `block M x N x K / stages / cluster`.
 
 use clap::{Parser, Subcommand};
 use deepgemm::prelude::*;
@@ -90,6 +97,11 @@ impl Timing {
 }
 
 fn main() {
+    // Bench runs always show the chosen configs (upstream `DG_PRINT_CONFIGS`):
+    // each unique problem -> config line is printed once.
+    if std::env::var_os("DG_PRINT_CONFIGS").is_none() {
+        std::env::set_var("DG_PRINT_CONFIGS", "1");
+    }
     let cli = Cli::parse();
     let ctx = DgContext::new(0).expect("failed to init CUDA context");
     println!(
@@ -140,7 +152,9 @@ fn main() {
             };
             match op.as_str() {
                 "fp4_nt_native" => {
-                    // Blackwell-native MXFP4 (e2m1 + UE8M0 per-32) end to end
+                    // Blackwell-native MXFP4 (e2m1 + UE8M0 per-32):
+                    // row 1 = GEMM kernel only (device-resident operands),
+                    // row 2 = full pipeline (quantize + GEMM + D2H).
                     let flops = 2.0 * m as f64 * n as f64 * k as f64;
                     let bf16 = |seed: u32, len: u32| -> Vec<u16> {
                         (0..len)
@@ -153,15 +167,248 @@ fn main() {
                     let a = bf16(3, m * k);
                     let b = bf16(5, n * k);
                     let ctx2 = &t.ctx;
-                    let mut out: Option<Vec<u16>> = None;
+                    let a_dev = upload(ctx2, &a).unwrap();
+                    let b_dev = upload(ctx2, &b).unwrap();
+                    let (a_data, a_sf) =
+                        deepgemm::ops_sm100::cast_bf16_to_fp4_packed_sf_dev(ctx2, &a_dev, k, m, k, 1)
+                            .unwrap();
+                    let (b_data, b_sf) =
+                        deepgemm::ops_sm100::cast_bf16_to_fp4_packed_sf_dev(ctx2, &b_dev, k, n, k, 1)
+                            .unwrap();
+                    let mut out =
+                        unsafe { ctx2.stream.alloc::<u16>((m * n) as usize).unwrap() };
                     t.run(
-                        "fp4_nt_native (incl. quantize)",
+                        &format!("fp4_nt_native gemm {m}x{n}x{k} (kernel only)"),
                         flops,
                         warmup,
                         iters,
                         || {
-                            out =
-                                deepgemm::ops_sm100::fp4_gemm_nt_native(ctx2, &a, &b, m, n, k).ok();
+                            deepgemm::ops_sm100::fp4_gemm_packed_dev(
+                                ctx2,
+                                &a_data,
+                                &a_sf,
+                                &b_data,
+                                &b_sf,
+                                &mut out,
+                                m,
+                                n,
+                                k,
+                            )
+                            .unwrap();
+                        },
+                    );
+                    let mut out2: Option<Vec<u16>> = None;
+                    t.run(
+                        "fp4_nt_native (incl. quantize + D2H)",
+                        flops,
+                        warmup,
+                        iters,
+                        || {
+                            out2 = deepgemm::ops_sm100::fp4_gemm_nt_native(
+                                ctx2, &a, &b, m, n, k,
+                            )
+                            .ok();
+                        },
+                    );
+                }
+                "fp4_grouped_contig" | "fp4_grouped_masked" => {
+                    // MoE grouped MXFP4: `groups` experts of `m` tokens each.
+                    let masked = op == "fp4_grouped_masked";
+                    let m_total = groups * m;
+                    let flops = 2.0 * m_total as f64 * n as f64 * k as f64;
+                    let bf16 = |seed: u32, len: u32| -> Vec<u16> {
+                        (0..len)
+                            .map(|i| {
+                                let v = (((i.wrapping_mul(seed)) % 17) as f32 - 8.0) / 8.0;
+                                ((v.to_bits() + 0x7FFF) >> 16) as u16
+                            })
+                            .collect()
+                    };
+                    let a = bf16(3, m_total * k);
+                    let b = bf16(5, groups * n * k);
+                    let ctx2 = &t.ctx;
+                    let a_dev = upload(ctx2, &a).unwrap();
+                    let b_dev = upload(ctx2, &b).unwrap();
+                    // A: masked stacks groups along the SF columns, contiguous
+                    // keeps one flat M arena; B: always grouped.
+                    let a_groups = if masked { groups } else { 1 };
+                    let (a_data, a_sf) = deepgemm::ops_sm100::cast_bf16_to_fp4_packed_sf_dev(
+                        ctx2, &a_dev, k, m_total, k, a_groups,
+                    )
+                    .unwrap();
+                    let (b_data, b_sf) = deepgemm::ops_sm100::cast_bf16_to_fp4_packed_sf_dev(
+                        ctx2,
+                        &b_dev,
+                        k,
+                        groups * n,
+                        k,
+                        groups,
+                    )
+                    .unwrap();
+                    let mut out =
+                        unsafe { ctx2.stream.alloc::<u16>((m_total * n) as usize).unwrap() };
+                    if masked {
+                        let masked_m: Vec<i32> = vec![m as i32; groups as usize];
+                        let masked_dev = upload(ctx2, &masked_m).unwrap();
+                        t.run(
+                            &format!(
+                                "fp4_grouped_masked g={groups} {m}x{n}x{k} (per expert)"
+                            ),
+                            flops,
+                            warmup,
+                            iters,
+                            || {
+                                let a_op = deepgemm::ops_sm100::LpOperand {
+                                    data: &a_data,
+                                    sf: &a_sf,
+                                    rows: m,
+                                    k,
+                                    ld: k,
+                                    bits: 4,
+                                    gran_k: 32,
+                                    major_mn: false,
+                                };
+                                let b_op = deepgemm::ops_sm100::LpOperand {
+                                    data: &b_data,
+                                    sf: &b_sf,
+                                    rows: n,
+                                    k,
+                                    ld: k,
+                                    bits: 4,
+                                    gran_k: 32,
+                                    major_mn: false,
+                                };
+                                let o = deepgemm::ops_sm100::Sm100Out::Bf16 {
+                                    buf: &mut out,
+                                    ld: n,
+                                };
+                                deepgemm::ops_sm100::m_grouped_fp8_fp4_gemm_masked_dev(
+                                    ctx2,
+                                    &a_op,
+                                    &masked_dev,
+                                    &b_op,
+                                    &o,
+                                    groups,
+                                    m,
+                                    &deepgemm::ops_sm100::Sm100Epilogue::default(),
+                                )
+                                .unwrap();
+                            },
+                        );
+                    } else {
+                        let m_indices: Vec<i32> = (0..m_total).map(|r| (r / m) as i32).collect();
+                        let m_idx = upload(ctx2, &m_indices).unwrap();
+                        t.run(
+                            &format!(
+                                "fp4_grouped_contig g={groups} {m}x{n}x{k} (per expert)"
+                            ),
+                            flops,
+                            warmup,
+                            iters,
+                            || {
+                                let a_op = deepgemm::ops_sm100::LpOperand {
+                                    data: &a_data,
+                                    sf: &a_sf,
+                                    rows: m_total,
+                                    k,
+                                    ld: k,
+                                    bits: 4,
+                                    gran_k: 32,
+                                    major_mn: false,
+                                };
+                                let b_op = deepgemm::ops_sm100::LpOperand {
+                                    data: &b_data,
+                                    sf: &b_sf,
+                                    rows: n,
+                                    k,
+                                    ld: k,
+                                    bits: 4,
+                                    gran_k: 32,
+                                    major_mn: false,
+                                };
+                                let o = deepgemm::ops_sm100::Sm100Out::Bf16 {
+                                    buf: &mut out,
+                                    ld: n,
+                                };
+                                deepgemm::ops_sm100::m_grouped_fp8_fp4_gemm_contiguous_dev(
+                                    ctx2,
+                                    &a_op,
+                                    &m_idx,
+                                    &b_op,
+                                    &o,
+                                    groups,
+                                    &deepgemm::ops_sm100::Sm100Epilogue::default(),
+                                )
+                                .unwrap();
+                            },
+                        );
+                    }
+                }
+                "fp8_nt_sm100" | "mxfp8_nt_sm100" => {
+                    // SM100 FP8: DeepSeek gran-128 recipe or MXFP8 gran-32.
+                    let gran = if op == "mxfp8_nt_sm100" { 32 } else { 128 };
+                    let flops = 2.0 * m as f64 * n as f64 * k as f64;
+                    let bf16 = |seed: u32, len: u32| -> Vec<u16> {
+                        (0..len)
+                            .map(|i| {
+                                let v = (((i.wrapping_mul(seed)) % 17) as f32 - 8.0) / 8.0;
+                                ((v.to_bits() + 0x7FFF) >> 16) as u16
+                            })
+                            .collect()
+                    };
+                    let a = bf16(3, m * k);
+                    let b = bf16(5, n * k);
+                    let ctx2 = &t.ctx;
+                    let a_dev = upload(ctx2, &a).unwrap();
+                    let b_dev = upload(ctx2, &b).unwrap();
+                    let (a_data, a_sf) = deepgemm::ops_sm100::cast_bf16_to_fp8_sf_dev(
+                        ctx2, &a_dev, k, m, k, gran, 1,
+                    )
+                    .unwrap();
+                    let (b_data, b_sf) = deepgemm::ops_sm100::cast_bf16_to_fp8_sf_dev(
+                        ctx2, &b_dev, k, n, k, gran, 1,
+                    )
+                    .unwrap();
+                    let mut out =
+                        unsafe { ctx2.stream.alloc::<u16>((m * n) as usize).unwrap() };
+                    t.run(
+                        &format!("{op} {m}x{n}x{k} (gran {gran}, kernel only)"),
+                        flops,
+                        warmup,
+                        iters,
+                        || {
+                            let a_op = deepgemm::ops_sm100::LpOperand {
+                                data: &a_data,
+                                sf: &a_sf,
+                                rows: m,
+                                k,
+                                ld: k,
+                                bits: 8,
+                                gran_k: gran,
+                                major_mn: false,
+                            };
+                            let b_op = deepgemm::ops_sm100::LpOperand {
+                                data: &b_data,
+                                sf: &b_sf,
+                                rows: n,
+                                k,
+                                ld: k,
+                                bits: 8,
+                                gran_k: gran,
+                                major_mn: false,
+                            };
+                            let o = deepgemm::ops_sm100::Sm100Out::Bf16 {
+                                buf: &mut out,
+                                ld: n,
+                            };
+                            deepgemm::ops_sm100::fp8_fp4_gemm_dev(
+                                ctx2,
+                                &a_op,
+                                &b_op,
+                                &o,
+                                &deepgemm::ops_sm100::Sm100Epilogue::default(),
+                            )
+                            .unwrap();
                         },
                     );
                 }
@@ -187,7 +434,7 @@ fn main() {
                             k,
                             n,
                             k,
-                            &mut deepgemm::ops_sm100::Sm100Out::Bf16 {
+                            &deepgemm::ops_sm100::Sm100Out::Bf16 {
                                 buf: &mut out,
                                 ld: n,
                             },
@@ -286,7 +533,9 @@ fn main() {
                     };
                     t.run(&label, flops, warmup, iters, &mut f);
                 }
-                other => eprintln!("unknown op {other:?} (fp8_nt | bf16_nt | grouped)"),
+                other => eprintln!(
+                    "unknown op {other:?} (fp4_nt_native | fp4_grouped_contig | fp4_grouped_masked | fp8_nt_sm100 | mxfp8_nt_sm100 | bf16_nt_sm100 | fp8_nt | bf16_nt | grouped)"
+                ),
             }
         }
         Cmd::Verify {

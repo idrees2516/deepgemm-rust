@@ -175,9 +175,48 @@ pub struct F32Tensor<'a> {
     pub ld: u32,
 }
 
-/// Helper: the M/N alignment (in rows) required by contiguous grouped GEMM
-/// (upstream `get_mk_alignment_for_contiguous_layout`).
-pub const MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT: u32 = 128;
+/// Helper: the default (SM90-era) M/K alignment (in rows) required by the
+/// contiguous grouped layout.
+pub const MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT: u32 = LEGACY_MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT;
+
+/// The legacy (SM90-era) M/K alignment of the m-grouped contiguous layout.
+pub const LEGACY_MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT: u32 = 128;
+
+static MK_ALIGNMENT_FOR_CONTIGUOUS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(LEGACY_MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT);
+
+/// Set the M/K alignment of the m-grouped contiguous layout (upstream
+/// `set_mk_alignment_for_contiguous_layout`).
+///
+/// This is a *layout contract* knob: it changes both the tile shape the
+/// heuristics pick (`block_m` for m-grouped GEMMs) and the padding the
+/// caller must apply when building the token layout. Must be a power of two
+/// in `[16, 256]`.
+pub fn set_mk_alignment_for_contiguous_layout(value: u32) {
+    assert!(
+        value.is_power_of_two() && (16..=256).contains(&value),
+        "mk alignment must be a power of two in [16, 256], got {value}"
+    );
+    MK_ALIGNMENT_FOR_CONTIGUOUS.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current M/K alignment of the m-grouped contiguous layout.
+pub fn get_mk_alignment_for_contiguous_layout() -> u32 {
+    MK_ALIGNMENT_FOR_CONTIGUOUS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The best alignment the architecture supports (upstream
+/// `get_theoretical_mk_alignment_for_contiguous_layout`): SM100's wider
+/// `UMMA_N = 256` allows a fixed 256-row alignment, which is friendlier to
+/// MoE cast, M-grouped and K-grouped operators. Small expected token counts
+/// may waste compute at 256; weigh before opting in.
+pub fn get_theoretical_mk_alignment_for_contiguous_layout(arch_major: u32) -> u32 {
+    if arch_major == 10 {
+        256
+    } else {
+        LEGACY_MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT
+    }
+}
 
 /// TMA alignment for scale factor tensors: pad the MN dim so each k-column
 /// of the transposed SF tensor is 16 bytes (4 floats).

@@ -637,8 +637,9 @@ pub const FP8FP4_KERNEL_3: &str = r#"
 }
 "#;
 
-/// The two store epilogues (normal and swap-AB), ported 1:1 from upstream
-/// `sm100_store_cd.cuh` / `sm100_store_cd_swap_ab.cuh`.
+// The two store epilogues (normal and swap-AB) live in `sm100_common.rs`
+// (`SM100_EPILOGUE_FNS`), ported 1:1 from upstream `sm100_store_cd.cuh` /
+// `sm100_store_cd_swap_ab.cuh`.
 
 /// Assemble the full SM100 FP8/FP4 GEMM translation unit for one config.
 pub fn build_fp8_fp4_source(cfg: &Fp8Fp4Config) -> String {

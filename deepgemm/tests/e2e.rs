@@ -403,3 +403,382 @@ fn sm100_bf16_gemm_nt() {
     }
     eprintln!("sm100 bf16 gemm ok");
 }
+
+// ===========================================================================
+// Blackwell (SM100): grouped MXFP4 GEMMs + the FP8 gran-128 recipe
+// ===========================================================================
+
+/// CPU mirror of the GPU `cast_bf16_to_fp4_packed_sf` quantization, packed
+/// into the grouped SF layout `(tma_aligned(group_rows), cols * groups)`.
+#[cfg(feature = "e2e")]
+fn mxfp4_quantize_grouped(rows: &[Vec<f32>], k: usize, groups: usize) -> (Vec<u8>, Vec<u32>) {
+    let group_rows = rows.len() / groups;
+    let cols = k / 128;
+    let aligned = group_rows.div_ceil(4) * 4;
+    let mut pack = vec![0u8; rows.len() * k / 2];
+    let mut sf = vec![0u32; cols * groups * aligned];
+    for (r, row) in rows.iter().enumerate() {
+        let (p, s) = rf::quantize_bf16_row_to_mxfp4(row);
+        pack[r * k / 2..(r + 1) * k / 2].copy_from_slice(&p);
+        let g = r / group_rows;
+        let local = r - g * group_rows;
+        for (j, &e) in s.iter().enumerate() {
+            sf[(g * cols + j / 4) * aligned + local] |= (e as u32) << ((j % 4) * 8);
+        }
+    }
+    (pack, sf)
+}
+
+#[cfg(feature = "e2e")]
+fn bf16_rows_host(v: &[u16], rows: usize, k: usize) -> Vec<Vec<f32>> {
+    v.chunks(k)
+        .map(|r| r.iter().map(|&x| bf16_from_bits(x)).collect())
+        .collect()
+}
+
+#[test]
+#[cfg(feature = "e2e")]
+fn sm100_m_grouped_fp4_contiguous() {
+    let ctx = DgContext::new(0).expect("cuda");
+    if !is_blackwell(&ctx) {
+        eprintln!("skipping: needs Blackwell");
+        return;
+    }
+    let (groups, gm, n, k) = (4u32, 128u32, 256u32, 512u32);
+    let m_total = groups * gm;
+    let mut s = 999u64;
+    let mut rnd = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+    };
+    let a: Vec<u16> = (0..m_total * k).map(|_| bf16_bits(rnd())).collect();
+    let b: Vec<u16> = (0..groups * n * k).map(|_| bf16_bits(rnd())).collect();
+    let af = bf16_rows_host(&a, m_total as usize, k as usize);
+    let bf = bf16_rows_host(&b, (groups * n) as usize, k as usize);
+
+    // A: one flat M arena (groups = 1); B: grouped along the SF columns.
+    let a_dev = upload(&ctx, &a).unwrap();
+    let b_dev = upload(&ctx, &b).unwrap();
+    let (a_data, a_sf) =
+        deepgemm::ops_sm100::cast_bf16_to_fp4_packed_sf_dev(&ctx, &a_dev, k, m_total, k, 1)
+            .unwrap();
+    let (b_data, b_sf) =
+        deepgemm::ops_sm100::cast_bf16_to_fp4_packed_sf_dev(&ctx, &b_dev, k, groups * n, k, groups)
+            .unwrap();
+    let m_indices: Vec<i32> = (0..m_total).map(|r| (r / gm) as i32).collect();
+    let m_idx = upload(&ctx, &m_indices).unwrap();
+    let mut out = unsafe { ctx.stream.alloc::<u16>((m_total * n) as usize).unwrap() };
+    let a_op = deepgemm::ops_sm100::LpOperand {
+        data: &a_data,
+        sf: &a_sf,
+        rows: m_total,
+        k,
+        ld: k,
+        bits: 4,
+        gran_k: 32,
+        major_mn: false,
+    };
+    let b_op = deepgemm::ops_sm100::LpOperand {
+        data: &b_data,
+        sf: &b_sf,
+        rows: n,
+        k,
+        ld: k,
+        bits: 4,
+        gran_k: 32,
+        major_mn: false,
+    };
+    let o = deepgemm::ops_sm100::Sm100Out::Bf16 {
+        buf: &mut out,
+        ld: n,
+    };
+    deepgemm::ops_sm100::m_grouped_fp8_fp4_gemm_contiguous_dev(
+        &ctx,
+        &a_op,
+        &m_idx,
+        &b_op,
+        &o,
+        groups,
+        &deepgemm::ops_sm100::Sm100Epilogue::default(),
+    )
+    .expect("grouped fp4 contiguous");
+
+    let (b_pack, b_sfp) = mxfp4_quantize_grouped(&bf, k as usize, groups as usize);
+    let got = download(&ctx, &out).unwrap();
+    let mut max_err = 0.0f32;
+    for g in 0..groups as usize {
+        // reference: rows [g*gm, (g+1)*gm) of A x rows [g*n, (g+1)*n) of B
+        let mut a_p = Vec::new();
+        let mut a_s = Vec::new();
+        for r in 0..gm as usize {
+            let row = &af[g * gm as usize + r];
+            let (p, s) = rf::quantize_bf16_row_to_mxfp4(row);
+            a_p.extend(p);
+            a_s.push(s);
+        }
+        let aligned_gm = (gm as usize).div_ceil(4) * 4;
+        let mut a_sf = vec![0u32; (k as usize / 128) * aligned_gm];
+        for (r, s) in a_s.iter().enumerate() {
+            for (j, &e) in s.iter().enumerate() {
+                a_sf[(j / 4) * aligned_gm + r] |= (e as u32) << ((j % 4) * 8);
+            }
+        }
+        let b_group_pack =
+            &b_pack[g * n as usize * k as usize / 2..(g + 1) * n as usize * k as usize / 2];
+        let b_group_sf = &b_sfp[g * (k as usize / 128) * ((n as usize).div_ceil(4) * 4)
+            ..(g + 1) * (k as usize / 128) * ((n as usize).div_ceil(4) * 4)];
+        let want = rf::mxfp4_gemm_reference(
+            &a_p,
+            &a_sf,
+            gm as usize,
+            b_group_pack,
+            b_group_sf,
+            n as usize,
+            k as usize,
+        );
+        for i in 0..gm as usize {
+            for j in 0..n as usize {
+                let row = g * gm as usize + i;
+                let got_v = bf16_from_bits(got[row * n as usize + j]);
+                max_err = max_err.max((got_v - want[i * n as usize + j]).abs());
+            }
+        }
+    }
+    let bound = k as f32 * 0.05;
+    assert!(
+        max_err < bound,
+        "grouped fp4 contiguous max err {max_err} >= {bound}"
+    );
+    eprintln!("sm100 grouped fp4 contiguous: max err {max_err:.4}");
+}
+
+#[test]
+#[cfg(feature = "e2e")]
+fn sm100_m_grouped_fp4_masked() {
+    let ctx = DgContext::new(0).expect("cuda");
+    if !is_blackwell(&ctx) {
+        eprintln!("skipping: needs Blackwell");
+        return;
+    }
+    let (groups, m_max, n, k) = (4u32, 128u32, 256u32, 512u32);
+    let masked_m: Vec<i32> = vec![37, 128, 1, 64];
+    let mut s = 4242u64;
+    let mut rnd = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+    };
+    let a: Vec<u16> = (0..groups * m_max * k).map(|_| bf16_bits(rnd())).collect();
+    let b: Vec<u16> = (0..groups * n * k).map(|_| bf16_bits(rnd())).collect();
+    let af = bf16_rows_host(&a, (groups * m_max) as usize, k as usize);
+    let bf = bf16_rows_host(&b, (groups * n) as usize, k as usize);
+
+    let a_dev = upload(&ctx, &a).unwrap();
+    let b_dev = upload(&ctx, &b).unwrap();
+    // Masked: BOTH sides use the grouped SF layout.
+    let (a_data, a_sf) = deepgemm::ops_sm100::cast_bf16_to_fp4_packed_sf_dev(
+        &ctx,
+        &a_dev,
+        k,
+        groups * m_max,
+        k,
+        groups,
+    )
+    .unwrap();
+    let (b_data, b_sf) =
+        deepgemm::ops_sm100::cast_bf16_to_fp4_packed_sf_dev(&ctx, &b_dev, k, groups * n, k, groups)
+            .unwrap();
+    let masked_dev = upload(&ctx, &masked_m).unwrap();
+    let mut out = unsafe {
+        ctx.stream
+            .alloc::<u16>((groups * m_max * n) as usize)
+            .unwrap()
+    };
+    let a_op = deepgemm::ops_sm100::LpOperand {
+        data: &a_data,
+        sf: &a_sf,
+        rows: m_max,
+        k,
+        ld: k,
+        bits: 4,
+        gran_k: 32,
+        major_mn: false,
+    };
+    let b_op = deepgemm::ops_sm100::LpOperand {
+        data: &b_data,
+        sf: &b_sf,
+        rows: n,
+        k,
+        ld: k,
+        bits: 4,
+        gran_k: 32,
+        major_mn: false,
+    };
+    let o = deepgemm::ops_sm100::Sm100Out::Bf16 {
+        buf: &mut out,
+        ld: n,
+    };
+    deepgemm::ops_sm100::m_grouped_fp8_fp4_gemm_masked_dev(
+        &ctx,
+        &a_op,
+        &masked_dev,
+        &b_op,
+        &o,
+        groups,
+        128, // expected_m
+        &deepgemm::ops_sm100::Sm100Epilogue::default(),
+    )
+    .expect("grouped fp4 masked");
+
+    let (b_pack, b_sfp) = mxfp4_quantize_grouped(&bf, k as usize, groups as usize);
+    let got = download(&ctx, &out).unwrap();
+    let mut max_err = 0.0f32;
+    for g in 0..groups as usize {
+        let valid = masked_m[g] as usize;
+        let mut a_p = Vec::new();
+        let mut a_s = Vec::new();
+        for r in 0..valid {
+            let row = &af[g * m_max as usize + r];
+            let (p, s) = rf::quantize_bf16_row_to_mxfp4(row);
+            a_p.extend(p);
+            a_s.push(s);
+        }
+        let aligned = (m_max as usize).div_ceil(4) * 4;
+        let mut a_sf = vec![0u32; (k as usize / 128) * aligned];
+        for (r, s) in a_s.iter().enumerate() {
+            for (j, &e) in s.iter().enumerate() {
+                a_sf[(j / 4) * aligned + r] |= (e as u32) << ((j % 4) * 8);
+            }
+        }
+        let b_group_pack =
+            &b_pack[g * n as usize * k as usize / 2..(g + 1) * n as usize * k as usize / 2];
+        let b_group_sf = &b_sfp[g * (k as usize / 128) * ((n as usize).div_ceil(4) * 4)
+            ..(g + 1) * (k as usize / 128) * ((n as usize).div_ceil(4) * 4)];
+        let want = rf::mxfp4_gemm_reference(
+            &a_p,
+            &a_sf,
+            valid,
+            b_group_pack,
+            b_group_sf,
+            n as usize,
+            k as usize,
+        );
+        for i in 0..valid {
+            for j in 0..n as usize {
+                let row = g * m_max as usize + i;
+                let got_v = bf16_from_bits(got[row * n as usize + j]);
+                max_err = max_err.max((got_v - want[i * n as usize + j]).abs());
+            }
+        }
+    }
+    let bound = k as f32 * 0.05;
+    assert!(
+        max_err < bound,
+        "grouped fp4 masked max err {max_err} >= {bound}"
+    );
+    eprintln!("sm100 grouped fp4 masked: max err {max_err:.4}");
+}
+
+#[test]
+#[cfg(feature = "e2e")]
+fn sm100_fp8_gemm_nt_gran128() {
+    let ctx = DgContext::new(0).expect("cuda");
+    if !is_blackwell(&ctx) {
+        eprintln!("skipping: needs Blackwell");
+        return;
+    }
+    let (m, n, k) = (256u32, 256u32, 768u32);
+    let mut s = 777u64;
+    let mut rnd = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 33) as f32 / u32::MAX as f32 - 0.5) * 2.0
+    };
+    let a: Vec<u16> = (0..m * k).map(|_| bf16_bits(rnd())).collect();
+    let b: Vec<u16> = (0..n * k).map(|_| bf16_bits(rnd())).collect();
+    let af = bf16_rows_host(&a, m as usize, k as usize);
+    let bf = bf16_rows_host(&b, n as usize, k as usize);
+
+    let a_dev = upload(&ctx, &a).unwrap();
+    let b_dev = upload(&ctx, &b).unwrap();
+    let (a_data, a_sf) =
+        deepgemm::ops_sm100::cast_bf16_to_fp8_sf_dev(&ctx, &a_dev, k, m, k, 128, 1).unwrap();
+    let (b_data, b_sf) =
+        deepgemm::ops_sm100::cast_bf16_to_fp8_sf_dev(&ctx, &b_dev, k, n, k, 128, 1).unwrap();
+    let mut out = unsafe { ctx.stream.alloc::<u16>((m * n) as usize).unwrap() };
+    let a_op = deepgemm::ops_sm100::LpOperand {
+        data: &a_data,
+        sf: &a_sf,
+        rows: m,
+        k,
+        ld: k,
+        bits: 8,
+        gran_k: 128,
+        major_mn: false,
+    };
+    let b_op = deepgemm::ops_sm100::LpOperand {
+        data: &b_data,
+        sf: &b_sf,
+        rows: n,
+        k,
+        ld: k,
+        bits: 8,
+        gran_k: 128,
+        major_mn: false,
+    };
+    let o = deepgemm::ops_sm100::Sm100Out::Bf16 {
+        buf: &mut out,
+        ld: n,
+    };
+    deepgemm::ops_sm100::fp8_fp4_gemm_dev(
+        &ctx,
+        &a_op,
+        &b_op,
+        &o,
+        &deepgemm::ops_sm100::Sm100Epilogue::default(),
+    )
+    .expect("fp8 gran128 gemm");
+
+    // CPU mirror of the gran-128 UE8M0 quantization + scaled GEMM
+    let quant = |rows: &[Vec<f32>]| -> Vec<Vec<f32>> {
+        rows.iter()
+            .map(|row| {
+                let mut out = Vec::with_capacity(row.len());
+                for chunk in row.chunks(128) {
+                    let amax = chunk.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+                    // dg_ue8m0_sf_exp_fp32(true, amax)
+                    let bits = amax.to_bits();
+                    let rounded = (bits + (1 << 23) - 1 - (0x60u32 << 16)) >> 23;
+                    let sf_exp = (rounded.max(8) + 127).max(105);
+                    let sf = f32::from_bits(sf_exp << 23);
+                    let inv = 1.0 / sf;
+                    for &v in chunk {
+                        out.push(rf::f32_to_e4m3(v * inv) as f32 * sf);
+                    }
+                }
+                out
+            })
+            .collect()
+    };
+    let aq = quant(&af);
+    let bq = quant(&bf);
+    let got = download(&ctx, &out).unwrap();
+    let mut max_err = 0.0f32;
+    for i in 0..m as usize {
+        for j in 0..n as usize {
+            let mut want = 0.0f32;
+            for kk in 0..k as usize {
+                want += aq[i][kk] * bq[j][kk];
+            }
+            let got_v = bf16_from_bits(got[i * n as usize + j]);
+            max_err = max_err.max((got_v - want).abs());
+        }
+    }
+    let bound = k as f32 * 0.01;
+    assert!(max_err < bound, "fp8 gran128 max err {max_err} >= {bound}");
+    eprintln!("sm100 fp8 gran128: max err {max_err:.4}");
+}

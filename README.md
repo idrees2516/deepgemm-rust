@@ -55,6 +55,34 @@ Key techniques (all ported, none stubbed):
 * **Blackwell-native quantization**: `cvt.rn.satfinite.e2m1x2.f32` (the
   fused F2FP+PACK idiom) for FP4, `e4m3x2` for FP8; packed-FP4 TMA via the
   `CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B/16B` descriptors.
+* **Grouped SF layout parity**: for masked/batched/contiguous grouped GEMMs
+  the scale factors use upstream's `(tma_aligned(group_rows), cols * groups)`
+  layout with the group index folded into the SF *column* coordinate (the
+  kernel reads `group * shape_sf_k + col`), for both the A and B sides.
+
+### The `mk_alignment` knob (MoE tile width)
+
+Upstream's `set_mk_alignment_for_contiguous_layout` controls both the tile
+shape the heuristics pick for m-grouped GEMMs and the layout contract the
+caller must honor (each group's tokens start at an aligned row of the A
+arena). This crate mirrors it exactly:
+
+```rust
+use deepgemm::types::{
+    get_theoretical_mk_alignment_for_contiguous_layout,
+    set_mk_alignment_for_contiguous_layout,
+};
+
+// SM100's UMMA_N=256 allows a fixed 256-row alignment (default: 128).
+// Opt in when your expected per-expert token counts are >= 256 so tiles
+// run at full width:
+set_mk_alignment_for_contiguous_layout(
+    get_theoretical_mk_alignment_for_contiguous_layout(10), // = 256 on SM100
+);
+```
+
+The MoE orchestration (`moe_fp8_layer`) and both SM90/SM100 heuristics read
+the same knob, so dispatch, padding and tile choice stay consistent.
 
 ```rust,no_run
 # fn main() -> deepgemm::DgResult<()> {
@@ -155,6 +183,29 @@ cargo run --release -p deepgemm-bench -- bench --op grouped --groups 256 --n 716
 cargo run --release -p deepgemm-bench -- bench --op bf16_nt --m 8192 --n 8192 --k 8192
 ```
 
+Blackwell (B200/GB200) ops — every bench prints its tile decision first
+(`DG_PRINT_CONFIGS` is on by default for `bench`):
+
+```sh
+# MXFP4 GEMM: row 1 = GEMM kernel only, row 2 = incl. quantize + D2H
+cargo run -p deepgemm-bench --release -- bench --op fp4_nt_native --m 8192 --n 8192 --k 7168
+# MoE grouped MXFP4 (contiguous / masked), 256 experts x 128 tokens
+cargo run -p deepgemm-bench --release -- bench --op fp4_grouped_contig  --groups 256 --m 128 --n 7168 --k 7168
+cargo run -p deepgemm-bench --release -- bench --op fp4_grouped_masked  --groups 128 --m 128 --n 2048 --k 7168
+# SM100 FP8: DeepSeek gran-128 recipe and MXFP8 gran-32
+cargo run -p deepgemm-bench --release -- bench --op fp8_nt_sm100   --m 4096 --n 7168 --k 7168
+cargo run -p deepgemm-bench --release -- bench --op mxfp8_nt_sm100 --m 4096 --n 7168 --k 7168
+cargo run -p deepgemm-bench --release -- bench --op bf16_nt_sm100  --m 8192 --n 8192 --k 8192
+```
+
+Example output (shapes will differ on your machine):
+
+```text
+[deepgemm] fp8_fp4_1d1d m=8192 n=8192 k=7168 groups=1 a_bits=4 b_bits=4 ...: block=128x256x256 stages=5 store_stages=2 cluster=1x2 swap_ab=0 swizzle=(128,128,128) smem=229232
+fp4_nt_native gemm 8192x8192x7168 (kernel only)     2.117 ms   454.62 TFLOPS
+fp4_nt_native (incl. quantize + D2H)                3.918 ms   245.61 TFLOPS
+```
+
 ## Correctness
 
 ```sh
@@ -162,7 +213,7 @@ cargo run --release -p deepgemm-bench -- bench --op bf16_nt --m 8192 --n 8192 --
 # if libnvrtc is present):
 LD_LIBRARY_PATH=... cargo test --workspace
 
-# Full end-to-end GPU tests (Hopper):
+# Full end-to-end GPU tests (skip automatically when the arch doesn't match):
 cargo test -p deepgemm --features e2e --test e2e -- --nocapture
 
 # CLI verify against the CPU reference:
@@ -170,9 +221,32 @@ cargo run --release -p deepgemm-bench -- verify --op fp8_nt --m 256 --n 512 --k 
 ```
 
 The `nvrtc_compile` test compiles **every** generated kernel variant (all block
-sizes × gemm types × multicast modes) for `sm_90a` and runs ptxas-level
-validation — it is the fastest way to catch kernel regressions in CI without a
-GPU.
+sizes × gemm types × multicast modes) for `sm_90a`/`sm_100a` and runs
+ptxas-level validation — it is the fastest way to catch kernel regressions in
+CI without a GPU.
+
+### B200 runbook
+
+```sh
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH   # CUDA 12.8+
+
+# 1) everything (e2e + TFLOPS sweep):
+./scripts/b200_run.sh
+# 2) or step by step:
+LD_LIBRARY_PATH=... cargo test -p deepgemm --features e2e --test e2e -- --nocapture
+LD_LIBRARY_PATH=... cargo run -p deepgemm-bench --release -- bench --op fp4_nt_native --m 8192 --n 8192 --k 7168
+```
+
+The e2e suite covers, on Blackwell: MXFP4 dense (`tcgen05.mma.kind::mxf4`),
+MXFP4 m-grouped contiguous (psum layout) and masked, FP8 gran-128 dense, and
+BF16; on Hopper it covers FP8 nt/contiguous/masked, BF16 and MQA logits.
+Grouped-GEMM scale factors are verified against a CPU mirror of the exact
+grouped-packed UE8M0 layout.
+
+The `bench` output intentionally pairs every TFLOPS number with its tile
+decision — if a shape underperforms, open an issue with the `[deepgemm]`
+config line + the TFLOPS row and the heuristics can be tuned for that class
+of shapes.
 
 ## Design notes & deliberate differences vs upstream
 

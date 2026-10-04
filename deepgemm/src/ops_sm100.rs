@@ -10,7 +10,7 @@ use cudarc::driver::safe::{CudaFunction, CudaSlice, CudaStream, DevicePtr};
 use cudarc::driver::sys::{self, CUtensorMap, CUtensorMapDataType, CUtensorMapSwizzle};
 
 use crate::cuda::bf16_gemm_sm100::build_bf16_source;
-use crate::cuda::fp8_fp4_gemm_1d1d::{build_fp8_fp4_source, Fp8Fp4Config};
+use crate::cuda::fp8_fp4_gemm_1d1d::build_fp8_fp4_source;
 use crate::cuda::sm100_cast::build_sm100_cast_source;
 use crate::device::DgContext;
 use crate::heuristics_sm100::{best_config, to_bf16_kernel_cfg, to_fp8fp4_kernel_cfg, Sm100Desc};
@@ -153,6 +153,32 @@ fn epilogue_op(epi: &Sm100Epilogue, out: &Sm100Out) -> DgResult<u32> {
         ));
     }
     Ok(if epi.alpha.is_some() { 1 } else { 0 })
+}
+
+/// Upstream `DG_PRINT_CONFIGS` parity: print each unique problem -> config
+/// mapping once, so benchmark runs can be correlated with tile choices.
+fn print_config_once(problem: &str, config: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static INIT: AtomicBool = AtomicBool::new(false);
+    if !INIT.swap(true, Ordering::Relaxed) {
+        ENABLED.store(
+            std::env::var("DG_PRINT_CONFIGS").is_ok_and(|v| v != "0"),
+            Ordering::Relaxed,
+        );
+    }
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static PRINTED: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    let set = PRINTED.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut guard) = set.lock() {
+        if guard.insert(problem.to_string()) {
+            println!("[deepgemm] {problem}: {config}");
+        }
+    }
 }
 
 // ===========================================================================
@@ -494,6 +520,7 @@ fn launch_fp8_fp4(
         } else {
             epi.tc_util.min(100)
         },
+        k_grouped: false,
     };
     let hcfg = best_config(&desc);
     let cfg = to_fp8fp4_kernel_cfg(
@@ -508,6 +535,28 @@ fn launch_fp8_fp4(
         epi_op,
         epi.accumulate,
         is_mxf4,
+    );
+    print_config_once(
+        &format!(
+            "fp8_fp4_1d1d m={m} n={n} k={k} groups={num_groups} a_bits={} b_bits={} gran=({},{}) type={:?}{}",
+            a.bits, b.bits, a.gran_k, b.gran_k, gemm_type,
+            if use_psum { "+psum" } else { "" }
+        ),
+        &format!(
+            "block={}x{}x{} stages={} store_stages={} cluster={}x{} swap_ab={} swizzle=({},{},{}) smem={}",
+            cfg.block_m,
+            cfg.block_n,
+            cfg.block_k,
+            cfg.num_stages,
+            cfg.num_tma_store_stages,
+            if cfg.is_multicast_on_a { 1 } else { cfg.multicast },
+            if cfg.is_multicast_on_a { cfg.multicast } else { 1 },
+            cfg.swap_ab,
+            cfg.swizzle_a,
+            cfg.swizzle_b,
+            cfg.swizzle_cd,
+            hcfg.smem_size
+        ),
     );
 
     let load_block_m = cfg.block_m
@@ -547,11 +596,12 @@ fn launch_fp8_fp4(
         batched_3d,
         is_mxf4,
     )?;
-    // A's SF covers the flat M rows; B's SF covers N x (groups) for grouped.
-    let sfa_groups = if gemm_type == GemmType::Batched {
-        num_groups
-    } else {
-        1
+    // A's SF: Normal/contiguous share one flat M arena (1 column group);
+    // masked and batched stack the groups along the SF column dimension
+    // (the kernel indexes SFA columns with `group * shape_sfa_k + col`).
+    let sfa_groups = match gemm_type {
+        GemmType::Batched | GemmType::MGroupedMasked => num_groups,
+        _ => 1,
     };
     let tm_sfa = make_sf_tma(
         &ctx.stream,
@@ -652,15 +702,6 @@ fn cd_elem_size(dt: u32) -> u32 {
         1 => 4,
         2 => 1,
         _ => 2,
-    }
-}
-
-impl Fp8Fp4Config {
-    fn is_k_grouped(&self) -> bool {
-        matches!(self.gemm_type, 3 | 6)
-    }
-    fn storage_store_n(&self) -> u32 {
-        self.swizzle_cd / cd_elem_size(self.cd_dtype)
     }
 }
 
@@ -883,9 +924,32 @@ pub fn bf16_gemm_dev(
         } else {
             epi.tc_util.min(100)
         },
+        k_grouped: false,
     };
     let hcfg = best_config(&desc);
     let cfg = to_bf16_kernel_cfg(&hcfg, &desc, 1, 0, 0, 0, epi_op, epi.accumulate);
+    print_config_once(
+        &format!("bf16_sm100 m={m} n={n} k={k}"),
+        &format!(
+            "block={}x{}x{} stages={} cluster={}x{} swap_ab={} tc_util={}",
+            cfg.block_m,
+            cfg.block_n,
+            cfg.block_k,
+            cfg.num_stages,
+            if cfg.is_multicast_on_a {
+                1
+            } else {
+                cfg.multicast
+            },
+            if cfg.is_multicast_on_a {
+                cfg.multicast
+            } else {
+                1
+            },
+            cfg.swap_ab,
+            cfg.tc_util
+        ),
+    );
 
     let load_block_m = cfg.block_m
         / if cfg.is_multicast_on_a {
@@ -1035,10 +1099,27 @@ pub fn sf_aligned_rows(rows: u32) -> u32 {
 
 /// Allocate the packed SF buffer for `(rows, k)` with granularity `gran_k`
 /// (zero-initialized — padding words read as 2^0 scales).
-pub fn alloc_sf(ctx: &DgContext, rows: u32, k: u32, gran_k: u32) -> DgResult<CudaSlice<u32>> {
+///
+/// `rows` is the **total** row count over `num_groups` groups
+/// (`rows = num_groups * group_rows`); the buffer takes the grouped layout
+/// `(tma_aligned(group_rows), cols * num_groups)` the SM100 SF TMA expects.
+/// `num_groups = 1` gives the flat `(tma_aligned(rows), cols)` layout.
+pub fn alloc_sf(
+    ctx: &DgContext,
+    rows: u32,
+    k: u32,
+    gran_k: u32,
+    num_groups: u32,
+) -> DgResult<CudaSlice<u32>> {
+    let groups = num_groups.max(1);
+    let group_rows = rows / groups;
     let mut buf = unsafe {
         ctx.stream
-            .alloc::<u32>(sf_packed_cols(k, gran_k) as usize * sf_aligned_rows(rows) as usize)
+            .alloc::<u32>(
+                sf_packed_cols(k, gran_k) as usize
+                    * groups as usize
+                    * sf_aligned_rows(group_rows) as usize,
+            )
             .map_err(|e| DgError::Driver(format!("{e:?}")))?
     };
     ctx.stream
@@ -1048,24 +1129,28 @@ pub fn alloc_sf(ctx: &DgContext, rows: u32, k: u32, gran_k: u32) -> DgResult<Cud
 }
 
 /// Quantize a BF16 tensor into packed e2m1 (FP4) + packed UE8M0 per-32 SFs
-/// (the MXFP4 recipe). `src` is `(rows, src_ld)` bf16; returns
-/// `(packed_data (rows, k/2), sf)`.
+/// (the MXFP4 recipe). `src` is `(rows, src_ld)` bf16 with
+/// `rows = num_groups * group_rows`; returns `(packed_data (rows, k/2), sf)`
+/// in the grouped-packed SF layout (see [`alloc_sf`]).
 pub fn cast_bf16_to_fp4_packed_sf_dev(
     ctx: &DgContext,
     src: &CudaSlice<u16>,
     src_ld: u32,
     rows: u32,
     k: u32,
+    num_groups: u32,
 ) -> DgResult<(CudaSlice<u8>, CudaSlice<u32>)> {
     if k % 128 != 0 {
         return Err(DgError::Shape("fp4 k must be a multiple of 128".into()));
     }
+    let groups = num_groups.max(1);
+    let group_rows = rows / groups;
     let dst = unsafe {
         ctx.stream
             .alloc::<u8>(rows as usize * k as usize / 2)
             .map_err(|e| DgError::Driver(format!("{e:?}")))?
     };
-    let sf = alloc_sf(ctx, rows, k, 32)?;
+    let sf = alloc_sf(ctx, rows, k, 32, groups)?;
     let func = cast_module_fn(ctx, "deepgemm_cast_bf16_to_fp4_packed_sf")?;
     let mut args = ArgBuilder::new();
     args.push(&DevPtr(dp(&ctx.stream, src)));
@@ -1073,9 +1158,10 @@ pub fn cast_bf16_to_fp4_packed_sf_dev(
     args.push(&DevPtr(dp(&ctx.stream, &dst)));
     args.push(&(k / 2));
     args.push(&DevPtr(dp(&ctx.stream, &sf)));
-    args.push(&sf_aligned_rows(rows));
+    args.push(&sf_aligned_rows(group_rows));
     args.push(&rows);
     args.push(&k);
+    args.push(&groups);
     unsafe {
         args.launch(
             &func,
@@ -1094,7 +1180,8 @@ pub fn cast_bf16_to_fp4_packed_sf_dev(
 }
 
 /// Quantize a BF16 tensor into e4m3 + packed UE8M0 SFs.
-/// `gran_k` = 32 (MXFP8) or 128 (the DeepSeek recipe).
+/// `gran_k` = 32 (MXFP8) or 128 (the DeepSeek recipe); `rows` is the total
+/// row count over `num_groups` groups (grouped-packed SF output).
 #[allow(clippy::too_many_arguments)]
 pub fn cast_bf16_to_fp8_sf_dev(
     ctx: &DgContext,
@@ -1103,6 +1190,7 @@ pub fn cast_bf16_to_fp8_sf_dev(
     rows: u32,
     k: u32,
     gran_k: u32,
+    num_groups: u32,
 ) -> DgResult<(CudaSlice<u8>, CudaSlice<u32>)> {
     if gran_k != 32 && gran_k != 128 {
         return Err(DgError::Shape("gran_k must be 32 or 128".into()));
@@ -1113,12 +1201,14 @@ pub fn cast_bf16_to_fp8_sf_dev(
             gran_k * 4
         )));
     }
+    let groups = num_groups.max(1);
+    let group_rows = rows / groups;
     let dst = unsafe {
         ctx.stream
             .alloc::<u8>(rows as usize * k as usize)
             .map_err(|e| DgError::Driver(format!("{e:?}")))?
     };
-    let sf = alloc_sf(ctx, rows, k, gran_k)?;
+    let sf = alloc_sf(ctx, rows, k, gran_k, groups)?;
     let name = if gran_k == 32 {
         "deepgemm_cast_bf16_to_fp8_sf_gran32"
     } else {
@@ -1131,9 +1221,10 @@ pub fn cast_bf16_to_fp8_sf_dev(
     args.push(&DevPtr(dp(&ctx.stream, &dst)));
     args.push(&k);
     args.push(&DevPtr(dp(&ctx.stream, &sf)));
-    args.push(&sf_aligned_rows(rows));
+    args.push(&sf_aligned_rows(group_rows));
     args.push(&rows);
     args.push(&k);
+    args.push(&groups);
     let elems_per_thread = gran_k * 4;
     unsafe {
         args.launch(
@@ -1153,7 +1244,8 @@ pub fn cast_bf16_to_fp8_sf_dev(
 }
 
 /// Transform power-of-two FP32 SFs `(rows, k/gran)` (K-major, stride
-/// `src_ld`) into the packed UE8M0 1d1d layout.
+/// `src_ld`; `rows` = total over `num_groups` groups) into the packed
+/// UE8M0 1d1d layout (grouped when `num_groups > 1`).
 #[allow(clippy::too_many_arguments)]
 pub fn transform_sf1d_packed_ue8m0_dev(
     ctx: &DgContext,
@@ -1162,17 +1254,21 @@ pub fn transform_sf1d_packed_ue8m0_dev(
     rows: u32,
     k: u32,
     gran_k: u32,
+    num_groups: u32,
 ) -> DgResult<CudaSlice<u32>> {
-    let dst = alloc_sf(ctx, rows, k, gran_k)?;
+    let groups = num_groups.max(1);
+    let group_rows = rows / groups;
+    let dst = alloc_sf(ctx, rows, k, gran_k, groups)?;
     let func = cast_module_fn(ctx, "deepgemm_transform_sf1d_packed_ue8m0")?;
     let mut args = ArgBuilder::new();
     args.push(&DevPtr(dp(&ctx.stream, src)));
     args.push(&src_ld);
     args.push(&DevPtr(dp(&ctx.stream, &dst)));
-    args.push(&sf_aligned_rows(rows));
+    args.push(&sf_aligned_rows(group_rows));
     args.push(&rows);
     args.push(&k);
     args.push(&gran_k);
+    args.push(&groups);
     unsafe {
         args.launch(
             &func,
@@ -1192,6 +1288,8 @@ pub fn transform_sf1d_packed_ue8m0_dev(
 
 /// Transform power-of-two FP32 2-D SFs `(ceil(rows/128), k/128)` (the
 /// DeepSeek weight recipe) into the packed UE8M0 1d1d layout (gran 128).
+/// `rows` = total over `num_groups` groups; each group must own a whole
+/// number of 128-row tiles (`rows / num_groups % 128 == 0`).
 #[allow(clippy::too_many_arguments)]
 pub fn transform_sf2d_packed_ue8m0_dev(
     ctx: &DgContext,
@@ -1199,16 +1297,25 @@ pub fn transform_sf2d_packed_ue8m0_dev(
     src_ld: u32,
     rows: u32,
     k: u32,
+    num_groups: u32,
 ) -> DgResult<CudaSlice<u32>> {
-    let dst = alloc_sf(ctx, rows, k, 128)?;
+    let groups = num_groups.max(1);
+    let group_rows = rows / groups;
+    if groups > 1 && group_rows % 128 != 0 {
+        return Err(DgError::Shape(format!(
+            "2-D SF groups must own whole 128-row tiles (group rows {group_rows})"
+        )));
+    }
+    let dst = alloc_sf(ctx, rows, k, 128, groups)?;
     let func = cast_module_fn(ctx, "deepgemm_transform_sf2d_packed_ue8m0")?;
     let mut args = ArgBuilder::new();
     args.push(&DevPtr(dp(&ctx.stream, src)));
     args.push(&src_ld);
     args.push(&DevPtr(dp(&ctx.stream, &dst)));
-    args.push(&sf_aligned_rows(rows));
+    args.push(&sf_aligned_rows(group_rows));
     args.push(&rows);
     args.push(&k);
+    args.push(&groups);
     unsafe {
         args.launch(
             &func,
@@ -1259,25 +1366,31 @@ pub fn unpack_fp4_raw_dev(
 // ===========================================================================
 
 /// `transform_sf`-layout (transposed TMA-aligned f32) -> packed UE8M0.
-#[allow(clippy::too_many_arguments)]
+/// `rows` = total over `num_groups` groups; the source carries the groups
+/// stacked along its leading dim — `(groups * k/gran, tma_aligned(group_rows))`,
+/// exactly what the SM90 [`crate::ops::transform_sf`] produces for batches.
 pub fn transform_sf_t_packed_ue8m0_dev(
     ctx: &DgContext,
     src: &CudaSlice<f32>,
     rows: u32,
     k: u32,
     gran_k: u32,
+    num_groups: u32,
 ) -> DgResult<CudaSlice<u32>> {
-    let dst = alloc_sf(ctx, rows, k, gran_k)?;
+    let groups = num_groups.max(1);
+    let group_rows = rows / groups;
+    let dst = alloc_sf(ctx, rows, k, gran_k, groups)?;
     let func = cast_module_fn(ctx, "deepgemm_transform_sf_t_f32_to_packed_ue8m0")?;
-    let stride = crate::types::tma_aligned_size(rows, 4);
+    let stride = crate::types::tma_aligned_size(group_rows, 4);
     let mut args = ArgBuilder::new();
     args.push(&DevPtr(dp(&ctx.stream, src)));
     args.push(&stride);
     args.push(&DevPtr(dp(&ctx.stream, &dst)));
-    args.push(&sf_aligned_rows(rows));
+    args.push(&sf_aligned_rows(group_rows));
     args.push(&rows);
     args.push(&k);
     args.push(&gran_k);
+    args.push(&groups);
     unsafe {
         args.launch(
             &func,
@@ -1308,9 +1421,9 @@ pub(crate) fn bridge_fp8_gemm_nt_dev(
     out_ld: u32,
 ) -> DgResult<()> {
     let (m, n, k) = (a.rows, b.rows, a.k);
-    let sf_a = transform_sf_t_packed_ue8m0_dev(ctx, a_sf_t, m, k, 128)?;
+    let sf_a = transform_sf_t_packed_ue8m0_dev(ctx, a_sf_t, m, k, 128, 1)?;
     // sfb is (num_groups * n_tiles, k_blocks) f32 k-contiguous: tile rows
-    let sf_b = transform_sf2d_packed_ue8m0_dev(ctx, sfb, k.div_ceil(128), n, k)?;
+    let sf_b = transform_sf2d_packed_ue8m0_dev(ctx, sfb, k.div_ceil(128), n, k, 1)?;
     let a_op = LpOperand {
         data: a.data,
         sf: &sf_a,
@@ -1352,8 +1465,10 @@ pub(crate) fn bridge_m_grouped_fp8_contiguous_dev(
     num_groups: u32,
 ) -> DgResult<()> {
     let (m, n, k) = (a.rows, b.rows / num_groups.max(1), a.k);
-    let sf_a = transform_sf_t_packed_ue8m0_dev(ctx, a_sf_t, m, k, 128)?;
-    let sf_b = transform_sf2d_packed_ue8m0_dev(ctx, sfb, k.div_ceil(128), b.rows, k)?;
+    // A's SF: one flat M arena (the contiguous kernel applies no group
+    // offset to SFA columns); B's SF: groups stacked along the columns.
+    let sf_a = transform_sf_t_packed_ue8m0_dev(ctx, a_sf_t, m, k, 128, 1)?;
+    let sf_b = transform_sf2d_packed_ue8m0_dev(ctx, sfb, k.div_ceil(128), b.rows, k, num_groups)?;
     let a_op = LpOperand {
         data: a.data,
         sf: &sf_a,
@@ -1406,8 +1521,11 @@ pub(crate) fn bridge_m_grouped_fp8_masked_dev(
     let m_max = a.rows;
     let n = b.rows / num_groups.max(1);
     let k = a.k;
-    let sf_a = transform_sf_t_packed_ue8m0_dev(ctx, a_sf_t, m_max, k, 128)?;
-    let sf_b = transform_sf2d_packed_ue8m0_dev(ctx, sfb, k.div_ceil(128), b.rows, k)?;
+    // Masked: both A's and B's SFs stack the groups along the SF columns
+    // (the kernel indexes SFA/SFB columns with `group * shape_sf_k + col`).
+    let sf_a =
+        transform_sf_t_packed_ue8m0_dev(ctx, a_sf_t, m_max * num_groups, k, 128, num_groups)?;
+    let sf_b = transform_sf2d_packed_ue8m0_dev(ctx, sfb, k.div_ceil(128), b.rows, k, num_groups)?;
     let a_op = LpOperand {
         data: a.data,
         sf: &sf_a,
@@ -1457,8 +1575,8 @@ pub(crate) fn bridge_fp8_bmm_dev(
     num_groups: u32,
 ) -> DgResult<()> {
     let (m, n, k) = (a.rows, b.rows, a.k);
-    let sf_a = transform_sf_t_packed_ue8m0_dev(ctx, a_sf_t, m * num_groups, k, 128)?;
-    let sf_b = transform_sf2d_packed_ue8m0_dev(ctx, sfb, k.div_ceil(128), n * num_groups, k)?;
+    let sf_a = transform_sf_t_packed_ue8m0_dev(ctx, a_sf_t, m * num_groups, k, 128, num_groups)?;
+    let sf_b = transform_sf2d_packed_ue8m0_dev(ctx, sfb, k.div_ceil(128), b.rows, k, num_groups)?;
     let a_op = LpOperand {
         data: a.data,
         sf: &sf_a,
@@ -1535,8 +1653,8 @@ pub fn fp4_gemm_nt_native(
 ) -> DgResult<Vec<u16>> {
     let a_dev = crate::ops::upload(ctx, a_bf16)?;
     let b_dev = crate::ops::upload(ctx, b_bf16)?;
-    let (a_data, a_sf) = cast_bf16_to_fp4_packed_sf_dev(ctx, &a_dev, k, m, k)?;
-    let (b_data, b_sf) = cast_bf16_to_fp4_packed_sf_dev(ctx, &b_dev, k, n, k)?;
+    let (a_data, a_sf) = cast_bf16_to_fp4_packed_sf_dev(ctx, &a_dev, k, m, k, 1)?;
+    let (b_data, b_sf) = cast_bf16_to_fp4_packed_sf_dev(ctx, &b_dev, k, n, k, 1)?;
     let mut out = unsafe {
         ctx.stream
             .alloc::<u16>(m as usize * n as usize)
@@ -1571,6 +1689,7 @@ pub fn fp4_gemm_nt_native(
 }
 
 /// Device-resident MXFP4 GEMM over pre-quantized operands.
+#[allow(clippy::too_many_arguments)]
 pub fn fp4_gemm_packed_dev(
     ctx: &DgContext,
     a_data: &CudaSlice<u8>,

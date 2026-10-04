@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Compile-tests every generated CUDA kernel through NVRTC + ptxas without a
+  # GPU (uses the pip NVRTC wheel).
+  nvrtc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install nvidia-cuda-nvrtc-cu12
+      - run: |
+          echo "NVRTC_DIR=$(python -c 'import nvidia.cuda_nvrtc, os; print(os.path.dirname(nvidia.cuda_nvrtc.__file__) + \"/lib\")')" >> $GITHUB_ENV
+      - run: cargo test -p deepgemm --test nvrtc_compile
+        env:
+          LD_LIBRARY_PATH: ${{ env.NVRTC_DIR }}
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --lib
+
+  # Template for a self-hosted GPU runner (Hopper). Add a runner with the
+  # `gpu-hopper` label to enable.
+  gpu-e2e:
+    if: false  # enable by adding a self-hosted runner and flipping this
+    runs-on: [self-hosted, gpu-hopper]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p deepgemm --features e2e --test e2e -- --nocapture
+      - run: cargo run --release -p deepgemm-bench -- verify --op fp8_nt

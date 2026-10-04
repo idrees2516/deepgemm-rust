@@ -83,7 +83,7 @@ pub fn best_fp8_config(
         }
         GemmType::MGroupedContiguous => {
             // Upstream: BLOCK_M fixed to the M/K alignment of the contiguous layout.
-            block_m_candidates.push(crate::types::MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT);
+            block_m_candidates.push(crate::types::get_mk_alignment_for_contiguous_layout());
         }
         GemmType::MGroupedMasked => {
             block_m_candidates.extend_from_slice(&[64, 128]);
@@ -268,7 +268,7 @@ pub fn best_bf16_config(
             block_m_candidates.push(256);
         }
         GemmType::MGroupedContiguous => {
-            block_m_candidates.push(crate::types::MK_ALIGNMENT_FOR_CONTIGUOUS_LAYOUT);
+            block_m_candidates.push(crate::types::get_mk_alignment_for_contiguous_layout());
         }
         GemmType::MGroupedMasked => {
             block_m_candidates.extend_from_slice(&[64, 128]);
