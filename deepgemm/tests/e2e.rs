@@ -690,7 +690,7 @@ fn sm100_fp8_gemm_nt_gran128() {
         eprintln!("skipping: needs Blackwell");
         return;
     }
-    let (m, n, k) = (256u32, 256u32, 768u32);
+    let (m, n, k) = (256u32, 256u32, 1024u32); // k must be a multiple of 512 (gran-128 cast)
     let mut s = 777u64;
     let mut rnd = || {
         s = s
