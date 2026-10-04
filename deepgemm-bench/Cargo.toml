@@ -1,0 +1,12 @@
+[package]
+name = "deepgemm-bench"
+description = "Benchmark + correctness CLI for deepgemm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepgemm = { path = "../deepgemm" }
+clap = { version = "4", features = ["derive"] }

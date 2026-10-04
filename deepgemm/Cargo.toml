@@ -1,0 +1,24 @@
+[package]
+name = "deepgemm"
+description = "DeepGEMM in pure Rust: FP8/BF16 fine-grained-scaled GEMM and MoE grouped GEMM for NVIDIA GPUs (SM90a TMA+WGMMA warp-specialized kernels, NVRTC runtime JIT, zero torch/nvcc dependency)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc", "cublaslt", "std", "dynamic-loading", "cuda-12090"] }
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+
+[features]
+default = []
+# End-to-end GPU tests (require a CUDA GPU + driver; run on a GPU machine)
+e2e = []
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["e2e"]
